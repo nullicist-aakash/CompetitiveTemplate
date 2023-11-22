@@ -698,14 +698,10 @@ public:
     }
 };
 
-template <typename T>
-class task;
-
-template <typename T>
+template <typename T, bool is_io_task = false>
 class task
 {
     using value_type = std::conditional_t<std::is_void_v<T>, void*, T>;
-    constexpr static bool is_io_task = false;
     class final_awaiter
     {
     public:
@@ -719,7 +715,7 @@ class task
         {
             auto recursive_info = h.promise().recursive_info;
             assert(recursive_info->back().first == h.address());
-            
+
             // Top is what we are returning from
             if (recursive_info->size() == 1 || recursive_info->back().second)
             {
@@ -742,7 +738,7 @@ class task
 public:
     class promise_type
     {
-        template <typename U>
+        template <typename U, bool>
         friend class task;
         value_type value{};
         bool is_latest_value = false;
@@ -808,8 +804,8 @@ public:
         return false;
     }
 
-    template <typename PROMISE>
-    coroutine_handle<> await_suspend(coroutine_handle<PROMISE> previous) noexcept
+    template <typename U>
+    coroutine_handle<> await_suspend(coroutine_handle<U> previous) noexcept
     {
         auto& previous_promise = previous.promise();
         auto& cur_promise = coro_.promise();
@@ -885,6 +881,9 @@ public:
 
             target_coroutine.resume();
 
+            queue_for_loop.push(std::move(_task));
+
+            continue;
             if (_task.get_handle_to_resume().second)
                 queue_for_io.push(std::move(_task));    // perform the task in thread pool
             else
@@ -898,25 +897,24 @@ public:
     }
 };
 
+task<int, true> hoo(int x, bool third)
+{
+	co_yield x + 2;
+}
+
 task<int> goo(int x, bool third)
 {
     co_yield x + 1;
+    co_yield co_await hoo(x, third);
     co_yield x + 3;
-}
-
-task<void> foo2(int x, bool third = false)
-{
-    auto res = goo(x, third);
-    cout << (co_await res) << endl;
-    cout << (co_await res) << endl;
-    if (third)
-        cout << (co_await res) << endl;
-    co_return;
 }
 
 task<void> foo(int x, bool third = false)
 {
-    co_await foo2(x, third);
+    auto res = goo(x, third);
+    cout << (co_await res) << endl;
+    cout << (co_await res) << endl;
+    cout << (co_await res) << endl;
     co_return;
 }
 
@@ -924,5 +922,6 @@ int main()
 {
     auto& el = EventLoop::get_instance();
     el.schedule_loop_task(foo(0));
+    el.schedule_loop_task(foo(10));
     el.run();
 }
