@@ -699,7 +699,7 @@ public:
 };
 
 template <typename T, bool is_io_task = false>
-class task
+class base_task
 {
     using value_type = std::conditional_t<std::is_void_v<T>, void*, T>;
     class final_awaiter
@@ -739,12 +739,12 @@ public:
     class promise_type
     {
         template <typename U, bool>
-        friend class task;
+        friend class base_task;
         value_type value{};
         bool is_latest_value = false;
         shared_ptr<vector<pair<void*, bool>>> recursive_info;
     public:
-        task get_return_object() noexcept { return task{ coroutine_handle<promise_type>::from_promise(*this) }; }
+        base_task get_return_object() noexcept { return base_task{ coroutine_handle<promise_type>::from_promise(*this) }; }
 
         suspend_always initial_suspend() noexcept
         {
@@ -788,12 +788,12 @@ public:
         }
     };
 
-    task(task&& t) noexcept : coro_(std::exchange(t.coro_, {}))
+    base_task(base_task&& t) noexcept : coro_(std::exchange(t.coro_, {}))
     {
 
     }
 
-    ~task()
+    ~base_task()
     {
         if (coro_)
             coro_.destroy();
@@ -839,24 +839,76 @@ private:
     pair<coroutine_handle<>, bool> get_handle_to_resume()
     {
         auto& info = coro_.promise().recursive_info;
-        if (info->empty())
-            return { coro_, is_io_task };
-
         return { coroutine_handle<>::from_address(info->back().first), info->back().second };
     }
 
+    size_t get_handles_count()
+    {
+        return coro_.promise().recursive_info->size();
+    }
+
     coroutine_handle<promise_type> coro_;
-    explicit task(coroutine_handle<promise_type> h) noexcept
+    explicit base_task(coroutine_handle<promise_type> h) noexcept
         : coro_(h)
     {}
 };
+
+template <typename T>
+using task = base_task<T, false>;
+
+template <typename T>
+using io_task = base_task<T, true>;
+
 
 class EventLoop
 {
     threadsafe_queue<task<void>> queue_for_loop;
     threadsafe_queue<task<void>> queue_for_io;
+    const int num_threads;
+    vector<thread> threads;
 
-    EventLoop() {}
+    EventLoop() : num_threads{ 10 } 
+    {
+        thread t = thread([&]() 
+            {
+                int counter = 0;
+                set<void*> io_coroutines;
+                while (true)
+                {
+					task<void> _task = std::move(queue_for_io.pop());  // blocks if no more task is available
+					auto [target_coroutine, is_io] = _task.get_handle_to_resume();
+
+                    void* addr = target_coroutine.address();
+                    bool in_set = io_coroutines.find(addr) != io_coroutines.end();
+
+                    if (!in_set)
+                    {
+                        ++counter;
+                        io_coroutines.insert(addr);
+                    }
+                    if (!is_io || in_set)
+                        --counter;
+
+                    if (counter == 0)
+                    {
+                        queue_for_loop.push(std::move(_task));
+                        continue;
+                    }
+
+                    // New I/O task just pushed
+                    io_coroutines.insert(addr);
+                    target_coroutine.resume();
+
+                    if (_task.get_handles_count() == 0)
+                        throw std::logic_error("Developer Bug. I/O task should not finish all 'calls' here.");
+
+                    queue_for_io.push(std::move(_task));
+                    continue;
+                }
+            });
+        t.detach();
+        threads.push_back(std::move(t));
+    }
     EventLoop(const EventLoop&) = delete;
     EventLoop& operator=(const EventLoop&) = delete;
     EventLoop(EventLoop&&) = delete;
@@ -876,10 +928,10 @@ public:
             task<void> _task = std::move(queue_for_loop.pop());  // blocks if no more task is available
             auto [target_coroutine, is_io] = _task.get_handle_to_resume();
 
-            if (target_coroutine.done())
-                continue;
-
             target_coroutine.resume();
+
+            if (_task.get_handles_count() == 0)
+                continue;
 
             queue_for_loop.push(std::move(_task));
 
@@ -897,31 +949,40 @@ public:
     }
 };
 
-task<int, true> hoo(int x, bool third)
+io_task<int> hoo(int x)
 {
 	co_yield x + 2;
 }
 
-task<int> goo(int x, bool third)
+io_task<int> goo(int x)
 {
     co_yield x + 1;
-    co_yield co_await hoo(x, third);
+    co_yield co_await hoo(x);
     co_yield x + 3;
+    co_return;
 }
 
-task<void> foo(int x, bool third = false)
+task<void> foo(int x)
 {
-    auto res = goo(x, third);
+    auto res = goo(x);
     cout << (co_await res) << endl;
     cout << (co_await res) << endl;
     cout << (co_await res) << endl;
     co_return;
 }
 
+generator<int> ioo()
+{
+    co_yield 1;
+	co_yield 2;
+	co_yield 3;
+	co_return;
+}
+
 int main()
 {
-    auto& el = EventLoop::get_instance();
-    el.schedule_loop_task(foo(0));
-    el.schedule_loop_task(foo(10));
-    el.run();
+    for (auto& x : ioo())
+    {
+        cout << x << endl;
+    }
 }
