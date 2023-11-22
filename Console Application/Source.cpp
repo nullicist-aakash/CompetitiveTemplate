@@ -28,6 +28,7 @@
 #include <coroutine>
 #include <thread>
 #include <mutex>
+#include <format>
 #include <condition_variable>
 
 using namespace std::complex_literals;
@@ -700,14 +701,11 @@ public:
 template <typename T>
 class task;
 
-class PauseExecution { };
-
-class IOTask {};
 template <typename T>
 class task
 {
     using value_type = std::conditional_t<std::is_void_v<T>, void*, T>;
-    constexpr static bool is_io_task = std::is_same_v<T, IOTask>;
+    constexpr static bool is_io_task = false;
     class final_awaiter
     {
     public:
@@ -721,11 +719,15 @@ class task
         {
             auto recursive_info = h.promise().recursive_info;
             assert(recursive_info->back().first == h.address());
-            recursive_info->pop_back();
-
-            if (recursive_info->empty())
+            
+            // Top is what we are returning from
+            if (recursive_info->size() == 1 || recursive_info->back().second)
+            {
+                recursive_info->pop_back();
                 return std::noop_coroutine();
+            }
 
+            recursive_info->pop_back();
             return coroutine_handle<>::from_address(recursive_info->back().first);
         }
 
@@ -743,6 +745,7 @@ public:
         template <typename U>
         friend class task;
         value_type value{};
+        bool is_latest_value = false;
         shared_ptr<vector<pair<void*, bool>>> recursive_info;
     public:
         task get_return_object() noexcept { return task{ coroutine_handle<promise_type>::from_promise(*this) }; }
@@ -762,6 +765,7 @@ public:
         {
             static_assert(!std::is_void_v<T>, "Cannot yield a value for a void task");
             value = std::move(t);
+            is_latest_value = true;
             return {};
         }
 
@@ -769,17 +773,23 @@ public:
         {
             static_assert(!std::is_void_v<T>, "Cannot yield a value for a void task");
             value = t;
-            return {};
-        }
-
-        suspend_always yield_value(PauseExecution st)
-        {
+            is_latest_value = true;
             return {};
         }
 
         void return_void() noexcept { }
 
-        void unhandled_exception() noexcept { std::terminate(); }
+        void unhandled_exception() noexcept {
+            try
+            {
+                std::rethrow_exception(std::current_exception());
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << "Caught exception: '" << e.what() << "'\n";
+            }
+            std::terminate();
+        }
     };
 
     task(task&& t) noexcept : coro_(std::exchange(t.coro_, {}))
@@ -809,17 +819,24 @@ public:
         cur_promise.recursive_info = previous_promise.recursive_info;
         cur_promise.recursive_info->push_back({ cur_addr, is_io_task });
 
-        if constexpr (is_same_v<T, IOTask>)
+        if constexpr (is_io_task)
             return std::noop_coroutine();
         return coro_;
     }
 
-    value_type await_resume() noexcept
+    T await_resume()
     {
         if constexpr (is_void_v<T>)
-            return nullptr;
+            return;
+        else
+        {
+            if (!coro_.promise().is_latest_value)
+                throw std::runtime_error(std::format(
+                    "Callee returned without yielding anything. Last yielded value was {}.", coro_.promise().value));
 
-        return coro_.promise().value;
+            coro_.promise().is_latest_value = false;
+            return coro_.promise().value;
+        }
     }
 
 private:
@@ -881,47 +898,25 @@ public:
     }
 };
 
-task<IOTask> fors2()
-{
-    co_return;
-}
-
-task<IOTask> fors()
-{
-    co_await fors2();
-    co_return;
-}
-
 task<int> goo(int x, bool third)
 {
     co_yield x + 1;
-    co_await fors();
-    co_yield x + 2;
-
-    if (third)
-    {
-        co_yield x + 3;
-    }
+    co_yield x + 3;
 }
 
 task<void> foo2(int x, bool third = false)
 {
     auto res = goo(x, third);
-    cout << co_await res << endl;
-    cout << co_await res << endl;
+    cout << (co_await res) << endl;
+    cout << (co_await res) << endl;
     if (third)
-        cout << co_await res << endl;
+        cout << (co_await res) << endl;
     co_return;
-}
-
-void fgoo(int x, bool third)
-{
-    EventLoop::get_instance().schedule_loop_task(foo2(x, third));
 }
 
 task<void> foo(int x, bool third = false)
 {
-    fgoo(x, third);
+    co_await foo2(x, third);
     co_return;
 }
 
