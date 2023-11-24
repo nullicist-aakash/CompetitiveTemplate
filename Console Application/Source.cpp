@@ -871,43 +871,44 @@ class EventLoop
     {
         thread t = thread([&]() 
             {
-                int counter = 0;
-                vector<void*> io_coroutines;
                 while (true)
                 {
 					task<void> _task = std::move(queue_for_io.pop());  // blocks if no more task is available
-					auto [target_coroutine, is_io] = _task.get_handle_to_resume();
+                    int counter = 0;
+                    vector<void*> io_coroutines;
 
-                    void* addr = target_coroutine.address();
-                    bool in_set = std::find(io_coroutines.begin(), io_coroutines.end(), addr) != io_coroutines.end();
-
-                    if (!in_set && is_io)
+                    while (true)
                     {
-                        ++counter;
-                        io_coroutines.push_back(addr);
+                        auto [target_coroutine, is_io] = _task.get_handle_to_resume();
+
+                        void* addr = target_coroutine.address();
+                        bool in_set = std::find(io_coroutines.begin(), io_coroutines.end(), addr) != io_coroutines.end();
+
+                        if (!in_set && is_io)
+                        {
+                            ++counter;
+                            io_coroutines.push_back(addr);
+                        }
+                        else if (!is_io || in_set)
+                        {
+                            io_coroutines.pop_back();
+                            --counter;
+                        }
+
+                        if (counter == 0)
+                        {
+                            queue_for_loop.push(std::move(_task));
+                            break;
+                        }
+
+                        assert(addr == io_coroutines.back());
+
+                        // New I/O task just pushed
+                        target_coroutine.resume();
+
+                        if (_task.get_handles_count() == 0)
+                            throw std::logic_error("Developer Bug. I/O task should not finish all 'calls' here.");
                     }
-                    else if (!is_io || in_set)
-                    {
-                        io_coroutines.pop_back();
-                        --counter;
-                    }
-
-                    if (counter == 0)
-                    {
-                        queue_for_loop.push(std::move(_task));
-                        continue;
-                    }
-
-                    assert(addr == io_coroutines.back());
-
-                    // New I/O task just pushed
-                    target_coroutine.resume();
-
-                    if (_task.get_handles_count() == 0)
-                        throw std::logic_error("Developer Bug. I/O task should not finish all 'calls' here.");
-
-                    queue_for_io.push(std::move(_task));
-                    continue;
                 }
             });
         t.detach();
@@ -950,38 +951,33 @@ public:
     }
 };
 
-io_task<int> hoo(int x)
-{
-    cout << "hoo: " << std::this_thread::get_id() << endl;
-    co_yield x + 2;
-}
-
 io_task<int> goo(int x)
 {
-    cout << "goo: " << std::this_thread::get_id() << endl;
+    clog << "goo: " << std::this_thread::get_id() << endl;
     co_yield x + 1;
-    cout << "goo: " << std::this_thread::get_id() << endl;
-    co_yield co_await hoo(x);
-    cout << "goo: " << std::this_thread::get_id() << endl;
+    clog << "goo: " << std::this_thread::get_id() << endl;
+    co_yield x + 2;
+    clog << "goo: " << std::this_thread::get_id() << endl;
     co_yield x + 3;
 }
 
 task<void> foo(int x)
 {
     auto res = goo(x);
-    cout << "foo: " << std::this_thread::get_id() << endl;
+    clog << "foo: " << std::this_thread::get_id() << endl;
     cout << (co_await res) << endl;
-    cout << "foo: " << std::this_thread::get_id() << endl;
+    clog << "foo: " << std::this_thread::get_id() << endl;
     cout << (co_await res) << endl;
-    cout << "foo: " << std::this_thread::get_id() << endl;
+    clog << "foo: " << std::this_thread::get_id() << endl;
     cout << (co_await res) << endl;
-    cout << "foo: " << std::this_thread::get_id() << endl;
+    clog << "foo: " << std::this_thread::get_id() << endl;
 }
 
 int main()
 {
+    clog.setstate(std::ios_base::failbit);
     auto& el = EventLoop::get_instance();
     el.schedule_loop_task(foo(0));
-    // el.schedule_loop_task(foo(10));
+    el.schedule_loop_task(foo(10));
     el.run();
 }
